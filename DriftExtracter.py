@@ -5,6 +5,7 @@ import sys
 
 import numpy as np
 from astropy.io import fits
+import datetime
 # from astropy import wcs, utils
 # import astropy.units as u
 # from astropy.stats import gaussian_sigma_to_fwhm
@@ -18,9 +19,51 @@ from ginga.qtw.QtHelp import QtGui, QtCore
 from ginga.qtw.ImageViewQt import CanvasView
 from ginga.util import plots
 # from ginga.util.io import io_fits
-# from ginga.util.loader import load_data
+from ginga.util.loader import load_data
 # from ginga.AstroImage import AstroImage
 from ginga.gw import Plot, Widgets
+
+class FileWriter(Widgets.Box):
+    def __init__(self, logger, points):
+        super(FileWriter, self).__init__()
+
+        vbox = Widgets.VBox()
+        text = Widgets.Label("Is this the target or comparison?", halign="center")
+        vbox.add_widget(text)
+        button_hbox = Widgets.HBox()
+        self.targetbtn = Widgets.Button("Target")
+        self.targetbtn.add_callback('activated', self.write_target)
+        button_hbox.add_widget(self.targetbtn)
+        self.comparisonbtn = Widgets.Button("Comparison")
+        self.comparisonbtn.add_callback('activated', self.write_comparison)
+        button_hbox.add_widget(self.comparisonbtn)
+        self.closebtn = Widgets.Button("Close")
+        self.closebtn.add_callback('activated', self.dismiss)
+        button_hbox.add_widget(self.closebtn)
+        vbox.add_widget(button_hbox)
+        self.add_widget(vbox)
+
+        self.points = points
+
+    def write_target(self, e):
+        try:
+            np.savetxt("targetprofile.csv", self.points, delimiter=",", fmt='%f')
+        except Exception as e:
+            print(e)
+        self.delete()
+    
+    def write_comparison(self, e):
+        try:
+            np.savetxt("comparisonprofile.csv", self.points, delimiter=",", fmt='%f')
+        except Exception as e:
+            print(e)
+        self.delete()
+
+
+    def dismiss(self, event):
+        self.delete()
+
+
 
 class Cuts(Widgets.Box):
 
@@ -60,51 +103,45 @@ class Cuts(Widgets.Box):
 
         self.cuts_plot = plots.CutsPlot(logger=self.logger,
                                         width=700, height=400)
+        self.points = []
         self.plot = Plot.PlotWidget(self.cuts_plot)
         self.plot.resize(400, 400)
         ax = self.cuts_plot.add_axis()
         ax.grid(True)
         vbox.add_widget(self.plot)
         control_hbox = Widgets.HBox()
-        self.freedraw = Widgets.Button("Free Draw")
-        self.freedraw.add_callback('activated', self.free_draw_cb)
-        control_hbox.add_widget(self.freedraw)
-        self.horizontaldraw = Widgets.Button("Horizontal")
-        self.horizontaldraw.add_callback('activated', self.horizontal_draw_cb)
-        control_hbox.add_widget(self.horizontaldraw)
-        self.verticaldraw = Widgets.Button("Vertical")
-        self.verticaldraw.add_callback('activated', self.vertical_draw_cb)
-        control_hbox.add_widget(self.verticaldraw)
-        vbox.add_widget(control_hbox)
+        self.savedata = Widgets.Button("Save Data")
+        self.savedata.add_callback('activated', self.save_data)
+        self.savedata.set_enabled(False)
+        control_hbox.add_widget(self.savedata)
+        self.maxtogglebtn = Widgets.Button("Max Finder: Off")
+        self.maxtogglebtn.add_callback('activated', self.max_finder_cb)
+        self.maxtogglebtn.set_enabled(True)
+        control_hbox.add_widget(self.maxtogglebtn)
         self.closebtn = Widgets.Button("Close")
         self.closebtn.add_callback('activated', self.dismiss)
-        vbox.add_widget(self.closebtn)
+        control_hbox.add_widget(self.closebtn)
+        vbox.add_widget(control_hbox)
         self.add_widget(vbox)
-
-        self.cut_mode = "Free"
-        self.freedraw.set_enabled(False)
-
         self.start()
         self.gui_up = True
         self.threadpool = QtCore.QThreadPool()
 
-    def free_draw_cb(self, event):
-        self.cut_mode = "Free"
-        self.freedraw.set_enabled(False)
-        self.horizontaldraw.set_enabled(True)
-        self.verticaldraw.set_enabled(True)
-    
-    def horizontal_draw_cb(self, event):
-        self.cut_mode = "Horizontal"
-        self.freedraw.set_enabled(True)
-        self.horizontaldraw.set_enabled(False)
-        self.verticaldraw.set_enabled(True)
-    
-    def vertical_draw_cb(self, event):
-        self.cut_mode = "Vertical"
-        self.freedraw.set_enabled(True)
-        self.horizontaldraw.set_enabled(True)
-        self.verticaldraw.set_enabled(False)
+        self.max_toggle = False
+        self.maxlinetag = "slit-line"
+
+        self.fw = None
+
+    def max_finder_cb(self, e):
+        if self.max_toggle == False:
+            self.max_toggle = True
+            self.replot_all()
+            self.maxtogglebtn.set_text("Max Finder: On")
+        else:
+            self.max_toggle = False
+            self.replot_all()
+            self.maxtogglebtn.set_text("Max Finder: Off")
+
     
     def delete_all(self):
         self.canvas.delete_all_objects()
@@ -147,6 +184,84 @@ class Cuts(Widgets.Box):
         # remove the canvas from the image
         p_canvas = self.fitsimage.get_canvas()
         p_canvas.delete_object_by_tag(self.layertag)
+    
+    def save_data(self, e):
+        if self.fw != None:
+            try:
+                self.fw.dismiss(None)
+            except AttributeError:
+                pass
+        self.fw = FileWriter(self.logger, self.points)
+        self.fw.show()
+
+    def get_max_pixels_on_line(self, x1, y1, x2, y2, image, getvalues=True):
+        """Updated to look for max in 10 pixel range
+        Uses Bresenham's line algorithm to enumerate the pixels along
+        a line.
+        (see http://en.wikipedia.org/wiki/Bresenham%27s_line_algorithm)
+
+        If `getvalues`==False then it will return tuples of (x, y) coordinates
+        instead of pixel values.
+        """
+        # NOTE: seems to be necessary or we get a non-terminating result
+        x1, y1, x2, y2 = int(x1), int(y1), int(x2), int(y2)
+
+        dx = abs(x2 - x1)
+        dy = abs(y2 - y1)
+        if dx > dy:
+            direction = 'horizontal'
+        else:
+            direction = 'vertical'
+        if x1 < x2:
+            sx = 1
+        else:
+            sx = -1
+        if y1 < y2:
+            sy = 1
+        else:
+            sy = -1
+        err = dx - dy
+
+        res = []
+        x, y = x1, y1
+        x_path = []
+        y_path = []
+        while True:
+            if getvalues:
+                try:
+                    max_arr = []
+                    for i in range (-5, 5):
+                        if direction == 'horizontal':
+                            val = image.get_data_xy(x, y+i)
+                        else:
+                            val = image.get_data_xy(x+i, y)
+                        max_arr.append(val)
+                    val = np.max(max_arr)
+                    max_index = max_arr.index(val)
+                    if direction == 'horizontal':
+                        y_update = y + max_index - 5
+                        x_update = x
+                    else:
+                        x_update = x + max_index - 5
+                        y_update = y
+                except Exception:
+                    val = np.nan
+                res.append(val)
+                x_path.append(x_update)
+                y_path.append(y_update)
+            else:
+                res.append((x, y))
+            if (x == x2) and (y == y2):
+                break
+            e2 = 2 * err
+            if e2 > -dy:
+                err = err - dy
+                x += sx
+            if e2 < dx:
+                err = err + dx
+                y += sy
+        path = np.array((x_path, y_path)).T
+        return res, path
 
     def redo(self):
         """This is called when a new image arrives or the data in the
@@ -157,14 +272,25 @@ class Cuts(Widgets.Box):
 
     def _plotpoints(self, obj, color):
 
-        image = self.fitsimage.get_vip()
+        try:
+            self.fitsimage.get_canvas().get_object_by_tag(self.maxlinetag)
+            self.fitsimage.get_canvas().delete_object_by_tag(self.maxlinetag)
+        except KeyError:
+            pass
 
+        image = self.fitsimage.get_vip()  
+        
         # Get points on the line
-        points = image.get_pixels_on_line(int(obj.x1), int(obj.y1),
-                                                  int(obj.x2), int(obj.y2))
+        if self.max_toggle == True:
+            self.points, max_path = self.get_max_pixels_on_line(int(obj.x1), int(obj.y1), int(obj.x2), int(obj.y2), image)
+            self.maxline = self.dc.Path(max_path, color='red')
+            self.fitsimage.get_canvas().add(self.maxline, tag=self.maxlinetag, redraw=True)
+        else:
+            self.points = image.get_pixels_on_line(int(obj.x1), int(obj.y1), int(obj.x2), int(obj.y2))
+        
 
-        self.cuts_plot.cuts(points, title = f"{self.cut_mode} Cut", xtitle="Line Index", ytitle="ADUs/COADD",
-                            color=color)
+        self.cuts_plot.cuts(self.points, title = f"Line Profile", xtitle="Line Index", ytitle="ADUs/COADD", color=color)
+        self.savedata.set_enabled(True)
 
 
     def _replot(self, lines):
@@ -192,21 +318,6 @@ class Cuts(Widgets.Box):
         self.canvas.redraw(whence=3)
 
         return True
-
-    def _create_cut(self, x1, y1, x2, y2, color='cyan'):
-        self.delete_all()
-        text = "cut"
-        # if not self.settings.get('label_cuts', False):
-        #     text = ''
-        line_obj = self.dc.Line(x1, y1, x2, y2, color=color,
-                                showcap=False)
-        text_obj = self.dc.Text(0, 0, text, color=color, coord='offset',
-                                ref_obj=line_obj)
-        obj = self.dc.CompoundObject(line_obj, text_obj)
-        # this is necessary for drawing cuts with width feature
-        obj.initialize(self.canvas, self.fitsimage, self.logger)
-        obj.set_data(cuts=True)
-        return obj
 
     def _create_cut_obj(self, cuts_obj, color='cyan'):
         self.delete_all()
@@ -262,49 +373,7 @@ class Cuts(Widgets.Box):
     def keydown(self, canvas, event, data_x, data_y, viewer):
         return True
 
-    def cut_at(self, cuttype):
-        """Perform a cut at the last mouse position in the image.
-        `cuttype` determines the type of cut made.
-        """
-        data_x, data_y = self.fitsimage.get_last_data_xy()
-        image = self.fitsimage.get_image()
-        wd, ht = image.get_size()
-
-        coords = []
-        if cuttype == 'horizontal':
-            coords.append((0, data_y, wd - 1, data_y))
-        elif cuttype == 'vertical':
-            coords.append((data_x, 0, data_x, ht - 1))
-
-        tag = "cut"
-        cuts = []
-        for (x1, y1, x2, y2) in coords:
-            # calculate center of line
-            wd = x2 - x1
-            dw = wd // 2
-            ht = y2 - y1
-            dh = ht // 2
-            x, y = x1 + dw + 4, y1 + dh + 4
-
-            cut = self._create_cut(x1, y1, x2, y2, color='cyan')
-            cuts.append(cut)
-            
-        cut = cuts[0]
-
-        cut.set_data(count=True)
-
-        self.canvas.delete_object_by_tag(tag)
-        self.canvas.add(cut, tag=tag)
-        self.add_cuts_tag(tag)
-
-        self.logger.debug("redoing cut plots")
-        return self.replot_all()
-
     def draw_cb(self, canvas, tag):
-        if self.cut_mode == "Horizontal":
-            return self.cut_at('horizontal')
-        elif self.cut_mode == "Vertical":
-            return self.cut_at('vertical')
         obj = canvas.get_object_by_tag(tag)
         canvas.delete_object_by_tag(tag)
 
@@ -330,12 +399,10 @@ class FitsViewer(QtGui.QMainWindow):
     def __init__(self, logger):
         super(FitsViewer, self).__init__()
         self.logger = logger
-        print("logging")
 
         # self.threadpool = QtCore.QThreadPool()
 
-        fi = CanvasView(self.logger, render='widget')
-        print("fi = CanvasView(self.logger, render='widget')")
+        fi = CanvasView(self.logger)
         fi.enable_autocuts('on')
         fi.set_autocut_params('zscale')
         fi.enable_autozoom('off')
@@ -344,9 +411,7 @@ class FitsViewer(QtGui.QMainWindow):
         # fi.set_callback('drag-drop', self.drop_file)
         # fi.set_bg(0.2, 0.2, 0.2)
         fi.ui_set_active(True)
-        print("fi.ui_set_active(True)")
         self.fitsimage = fi
-        print("self.fitsimage = fi")
 
         # enable some user interaction
         menubar = self.menuBar()
@@ -486,7 +551,6 @@ class FitsViewer(QtGui.QMainWindow):
         self.fitsimage.set_color_map('heat')
 
         self.base_zoom = 0
-        print("Fits viewer setup complete")
         
 
     def add_canvas(self, tag=None):
@@ -545,17 +609,18 @@ class FitsViewer(QtGui.QMainWindow):
 
     def quit(self, *args):
         self.logger.info("Attempting to shut down the application...")
-        self.stop_scan()
         time.sleep(1)
         # self.threadpool = False
         QtGui.QApplication.instance().quit()
 
     def load_file(self, filepath):
-            fitsData = fits.getdata(filepath, ext=0)
+            filepath = os.path.join(filepath, filepath)
+            fitsData = fits.getdata(filepath)
             header = fits.getheader(filepath)
             if self.fitsimage.get_image() == None:
                 recenter = True
-            self.fitsimage.set_image(filepath)
+            image = load_data(self.writeFits(header, fitsData), logger=self.logger)
+            self.fitsimage.set_image(image)
                 # self.setWindowTitle(filepath)
             if recenter == True:
                 self.recenter()
@@ -564,10 +629,10 @@ class FitsViewer(QtGui.QMainWindow):
             self.base_zoom = self.fitsimage.get_zoom()
 
     def open_file(self):
-            filters = "Images (*.fits)"
-            selected_filter = "Images (*.fits)"
+            filters = "Images (*.fz)"
+            selected_filter = "Images (*.fz)"
             res = QtGui.QFileDialog.getOpenFileName(self, "Open FITS file",
-                                                    str(self.nightpath()), filters, selected_filter)
+                                                    ".", filters, selected_filter)
             if isinstance(res, tuple):
                 fileName = res[0]
             else:
@@ -616,26 +681,19 @@ class FitsViewer(QtGui.QMainWindow):
         # self.pickstar(self.fitsimage)
 
 def main():
-    print("running app")
     app = QtGui.QApplication([])
 
     # ginga needs a logger.
     # If you don't want to log anything you can create a null logger by
     # using null=True in this call instead of log_stderr=True
-    print("running logger")
-    logger = log.get_logger("DriftExtracter", log_stderr=True, level=40)
-    print("running viewer")
+    logger = log.get_logger("DriftExtracter", log_stderr=True, level=40, log_file="DE.log")
     w = FitsViewer(logger)
-    print("running resize")
-    w.resize(615,800)
-    print("running show")
+    w.resize(1000,950)
     w.show()
-    print("running setActiveWindow")
     app.setActiveWindow(w)
-    print("running viewer")
     w.raise_()
     w.activateWindow()
-    # sys.exit(app.exec_())
+    sys.exit(app.exec_())
 
 if __name__ == "__main__":
     main()
